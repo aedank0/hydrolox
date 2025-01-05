@@ -14,6 +14,7 @@ use winit::{
     window::Window,
 };
 
+mod comp_data;
 mod framework;
 mod game;
 mod render;
