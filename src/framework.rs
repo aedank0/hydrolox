@@ -1,53 +1,56 @@
 use std::{
-    any::{Any, TypeId},
-    collections::hash_map::Entry,
-    sync::{Arc, RwLock},
-    usize,
+    collections::hash_map::Entry, fmt::Debug, num::NonZeroU64, sync::{Arc, RwLock}
 };
 
 use ahash::AHashMap;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::comp_data::CompData;
+use crate::game;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct Entity {
-    id: u64,
+    id: NonZeroU64,
 }
 mod entity_impl {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     pub fn next_id() -> u64 {
         NEXT_ID.fetch_add(1, Ordering::SeqCst)
     }
 }
 impl Entity {
+    pub const RESERVED: Self = Self { id: NonZeroU64::MAX };
     pub fn new() -> Self {
         Self {
-            id: entity_impl::next_id(),
+            id: NonZeroU64::new(entity_impl::next_id()).unwrap(),
         }
     }
 }
 
-#[derive(Debug)]
-struct Comptainer {
+pub trait Component: 'static + Debug + Serialize + DeserializeOwned {}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Comptainer<T> {
     id_to_pos: AHashMap<Entity, usize>,
-    comps: CompData,
+    comps: Vec<T>,
 }
-impl Comptainer {
-    fn new<T: Any>() -> Self {
-        Self {
-            id_to_pos: AHashMap::default(),
-            comps: CompData::new::<T>(),
-        }
+impl<T> Default for Comptainer<T> where T: Component {
+    fn default() -> Self {
+        Self { id_to_pos: AHashMap::default(), comps: Vec::default() }
     }
-    fn has_component(&self, entity: Entity) -> bool {
+}
+impl<T> Comptainer<T> where T: Component {
+    fn new() -> Self {
+        Self::default()
+    }
+    pub fn has_component(&self, entity: Entity) -> bool {
         self.id_to_pos.contains_key(&entity)
     }
-    fn add_component<T: Any>(&mut self, entity: Entity, component: T) -> Option<T> {
+    pub fn add_component(&mut self, entity: Entity, component: T) -> Option<T> {
         match self.id_to_pos.entry(entity) {
-            Entry::Occupied(entry) => Some(self.comps.replace(*entry.get(), component)),
+            Entry::Occupied(entry) => Some(std::mem::replace(&mut self.comps[*entry.get()], component)),
             Entry::Vacant(entry) => {
                 entry.insert(self.comps.len());
                 self.comps.push(component);
@@ -55,7 +58,7 @@ impl Comptainer {
             }
         }
     }
-    fn remove_component(&mut self, entity: Entity) -> bool {
+    pub fn remove_component(&mut self, entity: Entity) -> bool {
         if let Some(&i) = self.id_to_pos.get(&entity) {
             self.comps.swap_remove(i);
             if i < self.comps.len() {
@@ -71,14 +74,23 @@ impl Comptainer {
             false
         }
     }
+    pub fn len(&self) -> usize {
+        self.id_to_pos.len()
+    }
+    pub fn take(&mut self) -> (Vec<Entity>, Vec<T>) {
+        let mut entities = vec![Entity::RESERVED;self.id_to_pos.len()];
+        std::mem::take(&mut self.id_to_pos).into_iter().for_each(|(e, pos)| entities[pos] = e);
+
+        (entities, std::mem::take(&mut self.comps))
+    }
 }
 
-#[derive(Debug, Default)]
-pub struct Framework {
-    components: AHashMap<TypeId, Arc<RwLock<Comptainer>>>,
+#[derive(Debug, Default, Clone)]
+pub struct Components {
+    pub transforms: Arc<RwLock<Comptainer<game::Transform>>>
 }
-impl Framework {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+impl Components {
+    pub fn new() -> Self {
+        Self::default()
     }
 }

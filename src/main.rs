@@ -1,11 +1,15 @@
 use std::{
-    any::type_name, error::Error, panic, process::ExitCode, sync::{mpsc::Sender, Arc}, thread::{self, JoinHandle}, time::Duration
+    error::Error,
+    panic,
+    process::ExitCode,
+    sync::{mpsc::Sender, Arc},
+    thread::JoinHandle,
 };
 
-use framework::Framework;
+use framework::Components;
 use game::{Game, GameError, GameMessage};
-use log::{error, info, warn};
-use render::{Render, RenderError, RenderMessage};
+use log::{error, info};
+use render::{Render, RenderError, RenderInit, RenderMessage};
 use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalSize, Size},
@@ -14,24 +18,27 @@ use winit::{
     window::Window,
 };
 
-mod comp_data;
+//mod comp_data;
 mod framework;
 mod game;
 mod render;
 
-trait SystemMessage {
+pub trait SystemMessage {
     fn stop_msg() -> Self;
     fn system_name() -> &'static str;
 }
 
 #[derive(Debug)]
-struct SystemData<E: Error, M: SystemMessage> {
+pub struct SystemData<E: Error, M: SystemMessage> {
     thread: Option<JoinHandle<Result<(), E>>>,
     sender: Sender<M>,
 }
 impl<E: Error, M: SystemMessage> SystemData<E, M> {
-    fn new(thread: JoinHandle<Result<(), E>>, sender: Sender<M>) -> Self {
-        Self { thread: Some(thread), sender }
+    pub fn new(thread: JoinHandle<Result<(), E>>, sender: Sender<M>) -> Self {
+        Self {
+            thread: Some(thread),
+            sender,
+        }
     }
     fn is_thread_active(&self) -> bool {
         !self.thread.as_ref().unwrap().is_finished()
@@ -44,14 +51,19 @@ impl<E: Error, M: SystemMessage> Drop for SystemData<E, M> {
         }
         if let Some(thread) = self.thread.take() {
             match thread.join() {
-                Ok(res) => if let Err(err) = res {
-                    error!("{} thread returned with an error: {err}", M::system_name());
-                },
+                Ok(res) => {
+                    if let Err(err) = res {
+                        error!("{} thread returned with an error: {err}", M::system_name());
+                    }
+                }
                 Err(err) => {
                     if let Ok(err_str) = err.downcast::<&str>() {
                         error!("{} thread finished with panic: {err_str}", M::system_name());
                     } else {
-                        error!("{} thread finished with panic of unknown type", M::system_name());
+                        error!(
+                            "{} thread finished with panic of unknown type",
+                            M::system_name()
+                        );
                     }
                 }
             }
@@ -59,12 +71,22 @@ impl<E: Error, M: SystemMessage> Drop for SystemData<E, M> {
     }
 }
 
+pub trait System {
+    type Init;
+    type InitErr: Error;
+    type Err: Error;
+    type Msg: SystemMessage;
+
+    fn new(init: Self::Init) -> Result<SystemData<Self::Err, Self::Msg>, Self::InitErr>;
+    fn run(&mut self) -> Result<(), Self::Err>;
+}
+
 #[derive(Debug, Default)]
 struct App {
     window: Option<Arc<Window>>,
     render: Option<SystemData<RenderError, RenderMessage>>,
     game: Option<SystemData<GameError, GameMessage>>,
-    framework: Option<Arc<Framework>>,
+    components: Components,
 }
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
@@ -83,19 +105,16 @@ impl ApplicationHandler for App {
             );
         }
         if self.render.is_none() {
-            self.render = match Render::new(self.window.as_ref().unwrap().clone(), 1280, 720) {
-                    Ok(r) => Some(r),
-                    Err(err) => {
-                        error!("Failed to init rendering: {err}");
-                        panic!();
-                    }
-                };
+            self.render = match Render::new(RenderInit{ window: self.window.as_ref().unwrap().clone(), res_x: 1280, res_y: 720}) {
+                Ok(r) => Some(r),
+                Err(err) => {
+                    error!("Failed to init rendering: {err}");
+                    panic!();
+                }
+            };
         }
         if self.game.is_none() {
-            self.game = Some(Game::new());
-        }
-        if self.framework.is_none() {
-            self.framework = Some(Framework::new());
+            self.game = Some(Game::new(()).unwrap());
         }
     }
     fn window_event(
@@ -164,10 +183,9 @@ impl ApplicationHandler for App {
         }
     }
     fn new_events(&mut self, _: &winit::event_loop::ActiveEventLoop, _: winit::event::StartCause) {
-        if self.render.as_ref().unwrap().thread.unwrap().is_finished() {
-            error!("Render")
-            let render = self.render.take().unwrap();
-            match render.thread.join() {
+        if !self.render.as_ref().unwrap().is_thread_active() {
+            let mut render = self.render.take().unwrap();
+            match render.thread.take().unwrap().join() {
                 Ok(res) => {
                     if let Err(err) = res {
                         error!("Render error: {err}");
@@ -182,9 +200,9 @@ impl ApplicationHandler for App {
                 }
             }
         }
-        if self.game.as_ref().unwrap().thread.unwrap().is_finished() {
-            let render = self.game.take().unwrap();
-            if let Err(payload) = render.thread.join() {
+        if !self.game.as_ref().unwrap().is_thread_active() {
+            let mut game = self.game.take().unwrap();
+            if let Err(payload) = game.thread.take().unwrap().join() {
                 error!("Game thread panicked");
                 panic::resume_unwind(payload);
             } else {

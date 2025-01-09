@@ -3,13 +3,14 @@ use std::{
     fmt::Display,
     mem::size_of,
     sync::{
-        mpsc::{channel, Receiver, Sender},
+        mpsc::{channel, Receiver},
         Arc,
-    }, thread,
+    },
+    thread,
 };
 
-use log::{error, warn};
-use smallvec::{smallvec, smallvec_inline};
+use log::warn;
+use smallvec::smallvec;
 use vulkano::{
     buffer::BufferContents,
     descriptor_set::layout::{
@@ -20,7 +21,7 @@ use vulkano::{
         physical::PhysicalDeviceType, Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags,
     },
     format::Format,
-    image::{ImageAspects, ImageLayout, ImageUsage, SampleCount},
+    image::{ImageAspects, ImageLayout, ImageUsage},
     instance::{Instance, InstanceCreateInfo},
     pipeline::{
         graphics::{
@@ -30,7 +31,7 @@ use vulkano::{
             rasterization::{CullMode, RasterizationState},
             subpass::PipelineSubpassType,
             vertex_input::{
-                Vertex, VertexDefinition, VertexInputBindingDescription, VertexInputState,
+                Vertex, VertexDefinition, VertexInputState,
             },
             viewport::{Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
@@ -49,7 +50,7 @@ use vulkano::{
 };
 use winit::window::Window;
 
-use crate::{SystemData, SystemMessage};
+use crate::{System, SystemData, SystemMessage};
 
 mod shader {
     pub mod fore {
@@ -203,6 +204,12 @@ impl SystemMessage for RenderMessage {
     }
 }
 
+pub struct RenderInit {
+    pub window: Arc<Window>,
+    pub res_x: u16,
+    pub res_y: u16,
+}
+
 #[derive(Debug)]
 pub struct Render {
     receiver: Receiver<RenderMessage>,
@@ -212,11 +219,13 @@ pub struct Render {
     graphics_queue: Arc<Queue>,
     transfer_queue: Arc<Queue>,
 }
-impl Render {
-    pub fn new(
-        window: Arc<Window>,
-        res_x: u16,
-        res_y: u16,
+impl System for Render {
+    type Init = RenderInit;
+    type InitErr = RenderError;
+    type Err = RenderError;
+    type Msg = RenderMessage;
+    fn new(
+        RenderInit { window, res_x, res_y }: RenderInit
     ) -> Result<SystemData<RenderError, RenderMessage>, RenderError> {
         let (sender, receiver) = channel();
 
@@ -602,17 +611,14 @@ impl Render {
         )?;
 
         let mut render = Self {
-                receiver,
-                instance,
-                device,
-                graphics_queue,
-                transfer_queue,
-            };
+            receiver,
+            instance,
+            device,
+            graphics_queue,
+            transfer_queue,
+        };
 
-        Ok(SystemData::new(
-            thread::spawn(move || render.run()),
-            sender,
-        ))
+        Ok(SystemData::new(thread::spawn(move || render.run()), sender))
     }
     fn run(&mut self) -> Result<(), RenderError> {
         loop {

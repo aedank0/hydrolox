@@ -1,13 +1,15 @@
 use std::{
-    any::Any, error::Error, fmt::Display, sync::mpsc::{channel, Receiver, Sender}, thread
+    convert::Infallible, error::Error, fmt::Display, sync::mpsc::{channel, Receiver}, thread
 };
 
+use serde::{Deserialize, Serialize};
 use winit::{
     event::{ElementState, KeyEvent, MouseButton},
-    keyboard::KeyCode,
 };
 
-use crate::{SystemData, SystemMessage};
+use crate::{framework::{Component, Entity}, System, SystemData, SystemMessage};
+
+use hydrolox_pga3d as pga;
 
 #[derive(Debug)]
 pub enum GameMessage {
@@ -25,6 +27,13 @@ impl SystemMessage for GameMessage {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Transform {
+    pub parent: Option<Entity>,
+    pub transform: pga::transform::Transform,
+}
+impl Component for Transform {}
+
 #[derive(Debug)]
 pub enum GameError {}
 impl Display for GameError {
@@ -38,13 +47,18 @@ impl Error for GameError {}
 pub struct Game {
     receiver: Receiver<GameMessage>,
 }
-impl Game {
-    pub fn new() -> SystemData<GameError, GameMessage> {
+impl System for Game {
+    type Init = ();
+    type InitErr = Infallible;
+    type Err = GameError;
+    type Msg = GameMessage;
+
+    fn new(_: ()) -> Result<SystemData<GameError, GameMessage>, Infallible> {
         let (sender, receiver) = channel();
 
         let mut game = Self { receiver };
 
-        SystemData::new(thread::spawn(move || game.run()), sender)
+        Ok(SystemData::new(thread::spawn(move || game.run()), sender))
     }
     fn run(&mut self) -> Result<(), GameError> {
         loop {
