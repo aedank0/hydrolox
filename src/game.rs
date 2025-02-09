@@ -1,22 +1,23 @@
 use std::{
-    convert::Infallible, error::Error, fmt::Display, sync::mpsc::{channel, Receiver}, thread
+    convert::Infallible,
+    error::Error,
+    fmt::Display,
+    sync::{mpsc::Receiver, Arc},
 };
 
 use serde::{Deserialize, Serialize};
-use winit::{
-    event::{ElementState, KeyEvent, MouseButton},
+use winit::event::{ElementState, KeyEvent, MouseButton};
+
+use crate::{
+    framework::{Component, Components, Entity}, input, System, SystemMessage
 };
 
-use crate::{framework::{Component, Entity}, System, SystemData, SystemMessage};
-
-use hydrolox_pga3d as pga;
+use hydrolox_pga3d::prelude as pga;
 
 #[derive(Debug)]
 pub enum GameMessage {
     Stop,
-    Keyboard(KeyEvent),
-    MouseMove((f64, f64)),
-    MouseButton((MouseButton, ElementState)),
+    Action(input::Action),
 }
 impl SystemMessage for GameMessage {
     fn stop_msg() -> Self {
@@ -27,10 +28,29 @@ impl SystemMessage for GameMessage {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transform {
     pub parent: Option<Entity>,
-    pub transform: pga::transform::Transform,
+    pub motor: pga::Motor,
+}
+impl Transform {
+    pub fn new(parent: Option<Entity>, motor: pga::Motor) -> Self {
+        Self { parent, motor }
+    }
+    pub fn global_motor(&self, comps: &Components) -> pga::Motor {
+        if let Some(parent) = self.parent {
+            comps
+                .transforms
+                .read()
+                .unwrap()
+                .get(parent)
+                .unwrap()
+                .global_motor(comps)
+                .combine(self.motor)
+        } else {
+            self.motor
+        }
+    }
 }
 impl Component for Transform {}
 
@@ -53,21 +73,19 @@ impl System for Game {
     type Err = GameError;
     type Msg = GameMessage;
 
-    fn new(_: ()) -> Result<SystemData<GameError, GameMessage>, Infallible> {
-        let (sender, receiver) = channel();
-
-        let mut game = Self { receiver };
-
-        Ok(SystemData::new(thread::spawn(move || game.run()), sender))
+    fn new(
+        _: &Arc<Components>,
+        _: (),
+        receiver: Receiver<GameMessage>,
+    ) -> Result<Self, Infallible> {
+        Ok(Self { receiver })
     }
     fn run(&mut self) -> Result<(), GameError> {
         loop {
             for msg in self.receiver.try_iter() {
                 match msg {
                     GameMessage::Stop => return Ok(()),
-                    GameMessage::Keyboard(key) => todo!(),
-                    GameMessage::MouseMove(amt) => todo!(),
-                    GameMessage::MouseButton(mb) => todo!(),
+                    GameMessage::Action(action) => todo!(),
                 }
             }
         }

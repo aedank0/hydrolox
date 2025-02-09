@@ -11,8 +11,8 @@ struct Motor {
 
 layout(push_constant, std430) uniform PushData {
     mat4 proj;
-    Motor obj;
     Motor cam;
+    Motor obj;
 } push_data;
 
 layout(location = 0) out vec3 norm_out;

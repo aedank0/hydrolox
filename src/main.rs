@@ -2,12 +2,16 @@ use std::{
     error::Error,
     panic,
     process::ExitCode,
-    sync::{mpsc::Sender, Arc},
-    thread::JoinHandle,
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        Arc, RwLock,
+    },
+    thread::{self, JoinHandle},
 };
 
 use framework::Components;
 use game::{Game, GameError, GameMessage};
+use input::Input;
 use log::{error, info};
 use render::{Render, RenderError, RenderInit, RenderMessage};
 use winit::{
@@ -22,6 +26,7 @@ use winit::{
 mod framework;
 mod game;
 mod render;
+mod input;
 
 pub trait SystemMessage {
     fn stop_msg() -> Self;
@@ -71,22 +76,54 @@ impl<E: Error, M: SystemMessage> Drop for SystemData<E, M> {
     }
 }
 
-pub trait System {
+pub trait System: Send + 'static {
     type Init;
     type InitErr: Error;
-    type Err: Error;
+    type Err: Error + Send;
     type Msg: SystemMessage;
 
-    fn new(init: Self::Init) -> Result<SystemData<Self::Err, Self::Msg>, Self::InitErr>;
+    fn new(
+        comps: &Arc<Components>,
+        init: Self::Init,
+        recv: Receiver<Self::Msg>,
+    ) -> Result<Self, Self::InitErr>
+    where
+        Self: Sized;
     fn run(&mut self) -> Result<(), Self::Err>;
 }
 
-#[derive(Debug, Default)]
+fn new_system<T: System>(
+    comps: &Arc<Components>,
+    init: T::Init,
+) -> Result<SystemData<T::Err, T::Msg>, T::InitErr> {
+    let (sender, receiver) = channel();
+
+    let mut sys = T::new(comps, init, receiver)?;
+
+    Ok(SystemData::new(thread::spawn(move || sys.run()), sender))
+}
+
+#[derive(Debug)]
 struct App {
     window: Option<Arc<Window>>,
     render: Option<SystemData<RenderError, RenderMessage>>,
     game: Option<SystemData<GameError, GameMessage>>,
-    components: Components,
+    components: Arc<Components>,
+    input: Arc<RwLock<Input>>,
+}
+impl App {
+    fn new() -> Self {
+        let components = Arc::default();
+        let input = Arc::new(RwLock::new(match Input::new() {
+            Ok(i) => i,
+            Err(err) => {
+                log::error!("Failed to initialize bindings: {err}");
+                panic!();
+            }
+        }));
+
+        Self { window: None, render: None, game: None, components, input }
+    }
 }
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
@@ -105,7 +142,14 @@ impl ApplicationHandler for App {
             );
         }
         if self.render.is_none() {
-            self.render = match Render::new(RenderInit{ window: self.window.as_ref().unwrap().clone(), res_x: 1280, res_y: 720}) {
+            self.render = match new_system::<Render>(
+                &self.components,
+                RenderInit {
+                    window: self.window.as_ref().unwrap().clone(),
+                    res_x: 1280,
+                    res_y: 720,
+                },
+            ) {
                 Ok(r) => Some(r),
                 Err(err) => {
                     error!("Failed to init rendering: {err}");
@@ -114,7 +158,7 @@ impl ApplicationHandler for App {
             };
         }
         if self.game.is_none() {
-            self.game = Some(Game::new(()).unwrap());
+            self.game = Some(new_system::<Game>(&self.components, ()).unwrap());
         }
     }
     fn window_event(
@@ -124,21 +168,24 @@ impl ApplicationHandler for App {
         event: winit::event::WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => event_loop.exit(), //Possibly do something else here first (ex saving, asking if sure)
             WindowEvent::KeyboardInput {
                 device_id: _,
                 event: key,
                 is_synthetic: _,
             } => {
-                if let Err(err) = self
-                    .game
-                    .as_ref()
-                    .unwrap()
-                    .sender
-                    .send(GameMessage::Keyboard(key))
-                {
-                    error!("Failed to send key event to game: {err}");
-                    panic!();
+                let action_maybe = self.input.write().unwrap().handle_key(key);
+                if let Some(action) = action_maybe {
+                    if let Err(err) = self
+                        .game
+                        .as_ref()
+                        .unwrap()
+                        .sender
+                        .send(GameMessage::Action(action))
+                    {
+                        error!("Failed to send key event to game: {err}");
+                        panic!();
+                    }
                 }
             }
             WindowEvent::MouseInput {
@@ -146,15 +193,18 @@ impl ApplicationHandler for App {
                 state,
                 button,
             } => {
-                if let Err(err) = self
-                    .game
-                    .as_ref()
-                    .unwrap()
-                    .sender
-                    .send(GameMessage::MouseButton((button, state)))
-                {
-                    error!("Failed to send mouse button event to game: {err}");
-                    panic!();
+                let action_maybe = self.input.write().unwrap().handle_mouse_button(state, button);
+                if let Some(action) = action_maybe {
+                    if let Err(err) = self
+                        .game
+                        .as_ref()
+                        .unwrap()
+                        .sender
+                        .send(GameMessage::Action(action))
+                    {
+                        error!("Failed to send mouse button event to game: {err}");
+                        panic!();
+                    }
                 }
             }
             _ => (),
@@ -167,13 +217,14 @@ impl ApplicationHandler for App {
         event: winit::event::DeviceEvent,
     ) {
         match event {
-            DeviceEvent::MouseMotion { delta } => {
+            DeviceEvent::MouseMotion { delta: (x, y) } => {
+                let action = self.input.write().unwrap().handle_mouse_delta((x as f32, y as f32));
                 if let Err(err) = self
                     .game
                     .as_ref()
                     .unwrap()
                     .sender
-                    .send(GameMessage::MouseMove(delta))
+                    .send(GameMessage::Action(action))
                 {
                     error!("Failed to send mouse motion to game: {err}");
                     panic!();
@@ -233,7 +284,7 @@ fn main() -> ExitCode {
     };
     event_loop.set_control_flow(ControlFlow::Wait);
 
-    let mut app = App::default();
+    let mut app = App::new();
     if let Err(err) = event_loop.run_app(&mut app) {
         error!("Error running event loop: {err}");
         return ExitCode::FAILURE;

@@ -7,13 +7,21 @@ Hydrolox is written in Rust with shaders written in GLSL, and uses the [Vulkano]
 In place of a linear algebra library, I'm trying to code an implementation of 3D Projective Geometric Algebra, which ideally does fewer multiplications than using a 4x4 matrix. It's in a seperate repository: <https://github.com/aedank0/hydrolox-pga3d>.
 
 Some priorities for what I want to do next:
- - Complete and debug rendering system
- - ~~Refactor the CompData struct to no longer use unsafe code~~
+ - [ ] Complete and debug rendering system
+   - The initial version of the rendering system is now implemented, though it still needs to be tested
+   - Getting an initial working version of the Game system is required before testing can begin
+   - Vulkano just updated with breaking changes, so the rendering system needs to be updated to use the latest version
+   - The rendering system has been updated for the latest Vulkano version, but still needs to be tested
+ - [x] ~~Refactor the CompData struct to no longer use unsafe code~~
    - ~~Doing some research of other type-erased vec libraries like [any_vec](https://github.com/tower120/any_vec), it seems that using unsafe code is better overall in terms of efficiency and readability~~
    - ~~Instead of factoring out unsafe code, I refactored CompData to have more idiomatic use of NonNull and implemented lazy allocation~~
    - Implementing certain things like deserialization would be significantly more difficult while using type erasure, so I instead decided to just use typed containers, possibly with macros in the future if needed to reduce repetition
- - Finish implementing Game system
+ - [ ] Finish implementing Game system
    - This uses an ECS based framework for handling game object data and behaviours
    - Each of the ECS systems (which I'll call processes to differentiate from the core systems) will run in parellel using a threadpool
- - Implement the Input system
+ - [x] Implement the Input system
    - This system will handle user input events and translate them to actions, which will then be sent to the Game system
+   - The basic system is in place, more bindings will be added as needed when development on the actual game begins
+ - [x] Refactor the way core systems are initialized
+   - Currently core systems have duplicate code for creating themselves and spawning their threads, this code should be moved to a generic implementation on the System trait
+ - [ ] Implement a basic physics process and components
