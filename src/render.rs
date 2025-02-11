@@ -5,7 +5,7 @@ use std::{
     fs::File,
     mem::{offset_of, size_of},
     num::NonZeroU64,
-    sync::{mpsc::Receiver, Arc},
+    sync::{mpsc::Receiver, Arc, RwLock},
 };
 
 use ahash::AHashMap;
@@ -26,13 +26,16 @@ use vulkano::{
         RenderPassBeginInfo, SubpassBeginInfo, SubpassEndInfo,
     },
     descriptor_set::{
-        allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo}, layout::{
+        allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo},
+        layout::{
             DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo,
             DescriptorType,
-        }, DescriptorSet, WriteDescriptorSet
+        },
+        DescriptorSet, WriteDescriptorSet,
     },
     device::{
-        physical::PhysicalDeviceType, Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags,
+        physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, Queue,
+        QueueCreateInfo, QueueFlags,
     },
     format::{ClearValue, Format},
     image::{
@@ -48,6 +51,7 @@ use vulkano::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             depth_stencil::{CompareOp, DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
+            multisample::MultisampleState,
             rasterization::{CullMode, RasterizationState},
             subpass::PipelineSubpassType,
             vertex_input::{Vertex, VertexDefinition, VertexInputState},
@@ -65,7 +69,8 @@ use vulkano::{
     },
     shader::ShaderStages,
     swapchain::{
-        acquire_next_image, FromWindowError, PresentFuture, PresentMode, Surface, SurfaceInfo, Swapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo
+        acquire_next_image, FromWindowError, PresentFuture, PresentMode, Surface, SurfaceInfo,
+        Swapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo,
     },
     sync::{
         future::{FenceSignalFuture, JoinFuture, NowFuture},
@@ -77,6 +82,7 @@ use winit::{raw_window_handle::HandleError, window::Window};
 
 use crate::{
     framework::{Component, Components, Entity},
+    input::Input,
     System, SystemMessage,
 };
 
@@ -119,8 +125,8 @@ pub enum RenderError {
     ValidationErr(Box<ValidationError>),
     VulkanErr(VulkanError),
     HandleErr(HandleError),
-    AllocImgErr(Validated<AllocateImageError>),
-    AllocBufErr(Validated<AllocateBufferError>),
+    AllocImgErr(AllocateImageError),
+    AllocBufErr(AllocateBufferError),
     CmdBufExecErr(CommandBufferExecError),
     NoDevice,
     NoSrfFormats,
@@ -178,12 +184,18 @@ impl From<Box<ValidationError>> for RenderError {
 }
 impl From<Validated<AllocateImageError>> for RenderError {
     fn from(value: Validated<AllocateImageError>) -> Self {
-        Self::AllocImgErr(value)
+        match value {
+            Validated::Error(err) => Self::AllocImgErr(err),
+            Validated::ValidationError(err) => Self::ValidationErr(err),
+        }
     }
 }
 impl From<Validated<AllocateBufferError>> for RenderError {
     fn from(value: Validated<AllocateBufferError>) -> Self {
-        Self::AllocBufErr(value)
+        match value {
+            Validated::Error(err) => Self::AllocBufErr(err),
+            Validated::ValidationError(err) => Self::ValidationErr(err),
+        }
     }
 }
 impl From<CommandBufferExecError> for RenderError {
@@ -403,6 +415,7 @@ impl System for Render {
     type Msg = RenderMessage;
     fn new(
         comps: &Arc<Components>,
+        _: &Arc<RwLock<Input>>,
         RenderInit {
             window,
             res_x,
@@ -422,10 +435,11 @@ impl System for Render {
             info
         })?;
 
-        let surface = Surface::from_window(instance.clone(), window.clone()).map_err(|e| match e {
-            FromWindowError::RetrieveHandle(h) => RenderError::from(h),
-            FromWindowError::CreateSurface(c) => RenderError::from(c)
-        })?;
+        let surface =
+            Surface::from_window(instance.clone(), window.clone()).map_err(|e| match e {
+                FromWindowError::RetrieveHandle(h) => RenderError::from(h),
+                FromWindowError::CreateSurface(c) => RenderError::from(c),
+            })?;
 
         let phys_device = instance
             .enumerate_physical_devices()?
@@ -433,13 +447,7 @@ impl System for Render {
             .ok_or(RenderError::NoDevice)?;
 
         let &(srf_fmt, _srf_color_space) = phys_device
-            .surface_formats(
-                &surface,
-                SurfaceInfo {
-                    present_mode: Some(PresentMode::Mailbox),
-                    ..Default::default()
-                },
-            )?
+            .surface_formats(&surface, SurfaceInfo::default())?
             .first()
             .ok_or(RenderError::NoSrfFormats)?;
 
@@ -466,25 +474,32 @@ impl System for Render {
             })
             .ok_or(RenderError::NoTransferQueue)?;
 
+        let mut queue_create_infos = Vec::with_capacity(2);
+        queue_create_infos.push(QueueCreateInfo {
+            queue_family_index: graphics_queue_fam_id,
+            ..Default::default()
+        });
+        if transfer_queue_fam_id != graphics_queue_fam_id {
+            queue_create_infos.push(QueueCreateInfo {
+                queue_family_index: transfer_queue_fam_id,
+                ..Default::default()
+            });
+        }
+
         let (device, mut queue_iter) = Device::new(
             phys_device.clone(),
             DeviceCreateInfo {
-                queue_create_infos: vec![
-                    QueueCreateInfo {
-                        queue_family_index: graphics_queue_fam_id,
-                        ..Default::default()
-                    },
-                    QueueCreateInfo {
-                        queue_family_index: transfer_queue_fam_id,
-                        ..Default::default()
-                    },
-                ],
-                physical_devices: smallvec![],
+                queue_create_infos: queue_create_infos,
+                enabled_extensions: DeviceExtensions {
+                    khr_swapchain: true,
+                    ..Default::default()
+                },
+                //physical_devices: smallvec![],
                 ..Default::default()
             },
         )?;
         let graphics_queue = queue_iter.next().unwrap();
-        let transfer_queue = queue_iter.next().unwrap();
+        let transfer_queue = queue_iter.next().unwrap_or(graphics_queue.clone());
 
         let (swapchain, swap_imgs) = Swapchain::new(
             device.clone(),
@@ -602,7 +617,7 @@ impl System for Render {
                         ],
                         depth_stencil_attachment: Some(AttachmentReference {
                             attachment: 3,
-                            layout: ImageLayout::DepthAttachmentOptimal,
+                            layout: ImageLayout::DepthStencilAttachmentOptimal,
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -630,7 +645,7 @@ impl System for Render {
                             }),
                             Some(AttachmentReference {
                                 attachment: 3,
-                                layout: ImageLayout::DepthReadOnlyOptimal,
+                                layout: ImageLayout::ShaderReadOnlyOptimal,
                                 aspects: ImageAspects::DEPTH,
                                 ..Default::default()
                             }),
@@ -718,9 +733,7 @@ impl System for Render {
                     PipelineShaderStageCreateInfo::new(fore_vs_entry.clone()),
                     PipelineShaderStageCreateInfo::new(fore_fs_entry),
                 ],
-                vertex_input_state: Some(
-                    [VertexData::per_vertex()].definition(&fore_vs_entry)?,
-                ),
+                vertex_input_state: Some([VertexData::per_vertex()].definition(&fore_vs_entry)?),
                 input_assembly_state: Some(InputAssemblyState::default()),
                 viewport_state: Some(ViewportState {
                     viewports: smallvec![Viewport {
@@ -733,6 +746,7 @@ impl System for Render {
                     cull_mode: CullMode::Back,
                     ..Default::default()
                 }),
+                multisample_state: Some(MultisampleState::default()),
                 depth_stencil_state: Some(DepthStencilState {
                     depth: Some(DepthState {
                         write_enable: true,
@@ -849,6 +863,7 @@ impl System for Render {
                     cull_mode: CullMode::Back,
                     ..Default::default()
                 }),
+                multisample_state: Some(MultisampleState::default()),
                 color_blend_state: Some(ColorBlendState::with_attachment_states(
                     1,
                     ColorBlendAttachmentState::default(),
@@ -868,13 +883,16 @@ impl System for Render {
             },
         ));
 
+        let sharing = if graphics_queue_fam_id == transfer_queue_fam_id {
+            Sharing::Exclusive
+        } else {
+            Sharing::Concurrent(smallvec![graphics_queue_fam_id, transfer_queue_fam_id])
+        };
+
         let mat_buffer = Buffer::new_slice(
             alloc.clone(),
             BufferCreateInfo {
-                sharing: Sharing::Concurrent(smallvec![
-                    graphics_queue_fam_id,
-                    transfer_queue_fam_id
-                ]),
+                sharing,
                 usage: BufferUsage::UNIFORM_BUFFER | BufferUsage::TRANSFER_DST,
                 ..Default::default()
             },
@@ -931,13 +949,6 @@ impl System for Render {
                 .iter_mut()
             {
                 if instance.mesh_id.is_none() {
-                    if let Some(id) = self.mesh_name_to_id.get(&instance.mesh_name) {
-                        instance.mesh_id = Some(*id);
-                        self.meshes.get_mut(id).unwrap().entities.push(e);
-                    } else {
-                        //load mesh
-                        todo!();
-                    }
                     let id = match self.mesh_name_to_id.entry(instance.mesh_name.clone()) {
                         Entry::Occupied(occupied) => occupied.get().clone(),
                         Entry::Vacant(vacant) => {
@@ -979,7 +990,7 @@ impl System for Render {
                                 mesh.positions.chunks(3).zip(mesh.normals.chunks(3)).map(
                                     |(pos, norm)| {
                                         VertexData::new(
-                                            Vec3::new(pos[0], pos[1], pos[3]),
+                                            Vec3::new(pos[0], pos[1], pos[2]),
                                             Vec3::new(norm[0], norm[1], norm[2]),
                                         )
                                     },
@@ -1011,7 +1022,7 @@ impl System for Render {
                             let index_dst: Subbuffer<[u16]> = Buffer::new_slice(
                                 self.allocator.clone(),
                                 BufferCreateInfo {
-                                    usage: BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
+                                    usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
                                     ..Default::default()
                                 },
                                 AllocationCreateInfo::default(),
@@ -1052,7 +1063,7 @@ impl System for Render {
                             mesh_id
                         }
                     };
-                    instance.material_id = Some(id);
+                    instance.mesh_id = Some(id);
                 }
                 if instance.material_id.is_none() {
                     let id = match self.mat_name_to_id.entry(instance.material_name.clone()) {
@@ -1169,11 +1180,11 @@ impl System for Render {
                     .begin_render_pass(
                         RenderPassBeginInfo {
                             clear_values: vec![
-                                Some(ClearValue::Uint([0, 0, 255, 255])),
+                                Some(ClearValue::Float([0.0, 0.0, 1.0, 1.0])),
                                 Some(ClearValue::Float([0.0, 0.0, 0.0, 0.0])),
-                                Some(ClearValue::Uint([0, 0, 0, 0])),
-                                Some(ClearValue::Depth(f32::MIN)),
-                                Some(ClearValue::Uint([255, 0, 0, 255])),
+                                Some(ClearValue::Float([0.0, 0.0, 0.0, 0.0])),
+                                Some(ClearValue::Depth(0.0)),
+                                Some(ClearValue::Float([1.0, 0.0, 0.0, 1.0])),
                             ],
                             ..RenderPassBeginInfo::framebuffer(
                                 self.framebuffers[img_index as usize].clone(),
@@ -1188,9 +1199,9 @@ impl System for Render {
                         FramePush {
                             proj: [
                                 [self.inverse_aspect_ratio * proj_factor, 0.0, 0.0, 0.0],
-                                [0.0, proj_factor, 0.0, 0.0],
-                                [0.0, 0.0, 0.0, cam.near_plane],
-                                [0.0, 0.0, -1.0, 1.0],
+                                [0.0, -proj_factor, 0.0, 0.0],
+                                [0.0, 0.0, 0.0, -1.0],
+                                [0.0, 0.0, cam.near_plane, 1.0],
                             ],
                             cam: inv_cam,
                         },
@@ -1209,18 +1220,25 @@ impl System for Render {
                                 .bind_vertex_buffers(0, mesh.vert_buffer.clone())?
                                 .bind_index_buffer(mesh.index_buffer.clone())?;
                             for &e in &mesh.entities {
-                                builder
-                                    .push_constants(
-                                        self.fore_pipeline.layout().clone(),
-                                        offset_of!(PushData, obj) as u32,
-                                        transforms
-                                            .get(e)
-                                            .expect(&format!(
-                                                "Expected tranform of entity {e} in render"
-                                            ))
-                                            .motor,
+                                builder.push_constants(
+                                    self.fore_pipeline.layout().clone(),
+                                    offset_of!(PushData, obj) as u32,
+                                    transforms
+                                        .get(e)
+                                        .expect(&format!(
+                                            "Expected tranform of entity {e} in render"
+                                        ))
+                                        .motor,
+                                )?;
+                                unsafe {
+                                    builder.draw_indexed(
+                                        mesh.index_buffer.len() as u32,
+                                        1,
+                                        0,
+                                        0,
+                                        0,
                                     )?;
-                                unsafe { builder.draw_indexed(mesh.index_buffer.len() as u32, 1, 0, 0, 0)?; }
+                                }
                             }
                         }
                     }
@@ -1234,7 +1252,9 @@ impl System for Render {
                         0,
                         self.defer_desc_set.clone(),
                     )?;
-                unsafe { builder.draw(3, 1, 0, 0)?; }
+                unsafe {
+                    builder.draw(3, 1, 0, 0)?;
+                }
                 builder.end_render_pass(SubpassEndInfo::default())?;
 
                 let cb = builder.build()?;

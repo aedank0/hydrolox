@@ -1,0 +1,6 @@
+!Key KeyD: MoveRight
+!Key KeyW: MoveForward
+!MouseButton Left: PrimaryInteract
+!Key KeyA: MoveLeft
+!MouseButton Right: SecondaryInteract
+!Key KeyS: MoveBack

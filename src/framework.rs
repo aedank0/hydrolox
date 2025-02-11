@@ -220,6 +220,7 @@ pub struct Components {
     pub transforms: RwLock<Comptainer<game::Transform>>,
     pub static_mesh_instances: RwLock<Comptainer<render::StaticMeshInstance>>,
     pub cameras: RwLock<Comptainer<render::Camera>>,
+    pub action_handlers: RwLock<Comptainer<game::ActionHandler>>,
 }
 impl Components {
     pub fn new() -> Self {

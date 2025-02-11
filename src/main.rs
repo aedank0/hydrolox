@@ -25,8 +25,8 @@ use winit::{
 //mod comp_data;
 mod framework;
 mod game;
-mod render;
 mod input;
+mod render;
 
 pub trait SystemMessage {
     fn stop_msg() -> Self;
@@ -84,6 +84,7 @@ pub trait System: Send + 'static {
 
     fn new(
         comps: &Arc<Components>,
+        input: &Arc<RwLock<Input>>,
         init: Self::Init,
         recv: Receiver<Self::Msg>,
     ) -> Result<Self, Self::InitErr>
@@ -94,13 +95,20 @@ pub trait System: Send + 'static {
 
 fn new_system<T: System>(
     comps: &Arc<Components>,
+    input: &Arc<RwLock<Input>>,
     init: T::Init,
 ) -> Result<SystemData<T::Err, T::Msg>, T::InitErr> {
     let (sender, receiver) = channel();
 
-    let mut sys = T::new(comps, init, receiver)?;
+    let mut sys = T::new(comps, input, init, receiver)?;
 
-    Ok(SystemData::new(thread::spawn(move || sys.run()), sender))
+    Ok(SystemData::new(
+        thread::Builder::new()
+            .name(format!("{} system thread", T::Msg::system_name()))
+            .spawn(move || sys.run())
+            .unwrap(),
+        sender,
+    ))
 }
 
 #[derive(Debug)]
@@ -122,7 +130,13 @@ impl App {
             }
         }));
 
-        Self { window: None, render: None, game: None, components, input }
+        Self {
+            window: None,
+            render: None,
+            game: None,
+            components,
+            input,
+        }
     }
 }
 impl ApplicationHandler for App {
@@ -131,7 +145,8 @@ impl ApplicationHandler for App {
             self.window = Some(
                 match event_loop.create_window(
                     Window::default_attributes()
-                        .with_inner_size(Size::Physical(PhysicalSize::new(1280, 720))),
+                        .with_inner_size(Size::Physical(PhysicalSize::new(1280, 720)))
+                        .with_resizable(false),
                 ) {
                     Ok(w) => Arc::new(w),
                     Err(err) => {
@@ -144,6 +159,7 @@ impl ApplicationHandler for App {
         if self.render.is_none() {
             self.render = match new_system::<Render>(
                 &self.components,
+                &self.input,
                 RenderInit {
                     window: self.window.as_ref().unwrap().clone(),
                     res_x: 1280,
@@ -158,7 +174,7 @@ impl ApplicationHandler for App {
             };
         }
         if self.game.is_none() {
-            self.game = Some(new_system::<Game>(&self.components, ()).unwrap());
+            self.game = Some(new_system::<Game>(&self.components, &self.input, ()).unwrap());
         }
     }
     fn window_event(
@@ -193,7 +209,11 @@ impl ApplicationHandler for App {
                 state,
                 button,
             } => {
-                let action_maybe = self.input.write().unwrap().handle_mouse_button(state, button);
+                let action_maybe = self
+                    .input
+                    .write()
+                    .unwrap()
+                    .handle_mouse_button(state, button);
                 if let Some(action) = action_maybe {
                     if let Err(err) = self
                         .game
@@ -218,7 +238,11 @@ impl ApplicationHandler for App {
     ) {
         match event {
             DeviceEvent::MouseMotion { delta: (x, y) } => {
-                let action = self.input.write().unwrap().handle_mouse_delta((x as f32, y as f32));
+                let action = self
+                    .input
+                    .write()
+                    .unwrap()
+                    .handle_mouse_delta((x as f32, y as f32));
                 if let Err(err) = self
                     .game
                     .as_ref()
@@ -234,31 +258,35 @@ impl ApplicationHandler for App {
         }
     }
     fn new_events(&mut self, _: &winit::event_loop::ActiveEventLoop, _: winit::event::StartCause) {
-        if !self.render.as_ref().unwrap().is_thread_active() {
-            let mut render = self.render.take().unwrap();
-            match render.thread.take().unwrap().join() {
-                Ok(res) => {
-                    if let Err(err) = res {
-                        error!("Render error: {err}");
-                    } else {
-                        error!("Renderer stopped without error");
+        if let Some(render) = self.render.as_ref() {
+            if !render.is_thread_active() {
+                let mut render = self.render.take().unwrap();
+                match render.thread.take().unwrap().join() {
+                    Ok(res) => {
+                        if let Err(err) = res {
+                            error!("Render error: {err}");
+                        } else {
+                            error!("Renderer stopped without error");
+                        }
+                        panic!();
                     }
-                    panic!();
-                }
-                Err(payload) => {
-                    error!("Render thread panicked");
-                    panic::resume_unwind(payload);
+                    Err(payload) => {
+                        error!("Render thread panicked");
+                        panic::resume_unwind(payload);
+                    }
                 }
             }
         }
-        if !self.game.as_ref().unwrap().is_thread_active() {
-            let mut game = self.game.take().unwrap();
-            if let Err(payload) = game.thread.take().unwrap().join() {
-                error!("Game thread panicked");
-                panic::resume_unwind(payload);
-            } else {
-                error!("Game stopped without error");
-                panic!();
+        if let Some(game) = self.game.as_ref() {
+            if !game.is_thread_active() {
+                let mut game = self.game.take().unwrap();
+                if let Err(payload) = game.thread.take().unwrap().join() {
+                    error!("Game thread panicked");
+                    panic::resume_unwind(payload);
+                } else {
+                    error!("Game stopped without error");
+                    panic!();
+                }
             }
         }
     }

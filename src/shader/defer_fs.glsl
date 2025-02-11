@@ -13,10 +13,13 @@ void main() {
     vec2 norm_xy = subpassLoad(norm_in).xy;
     vec3 norm = vec3(norm_xy, sqrt(1.0 - (norm_xy.x * norm_xy.x + norm_xy.y * norm_xy.y)));
 
-    vec3 sun_angle = vec3(0.0, -1.0, 0.0);
-    vec3 sun_color = vec3(1.0, 1.0, 1.0);
+    vec3 sun_angle = normalize(vec3(1.0, 0.0, 0.0));
+    vec3 dark_color = vec3(0.01, 0.01, 0.01);
 
-    float spec = dot(norm, sun_angle);
+    float light = dot(norm, sun_angle);
+    if (pos.z == 1.0) {
+        light = 1.0;
+    }
 
-    color_out = vec4(subpassLoad(color_in).rgb * (1.0 - spec)  + sun_color * spec, 1.0);
+    color_out = vec4(subpassLoad(color_in).rgb * light + dark_color * (1.0 - light), 1.0);
 }

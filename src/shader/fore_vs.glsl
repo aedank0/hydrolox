@@ -16,7 +16,7 @@ layout(push_constant, std430) uniform PushData {
 } push_data;
 
 layout(location = 0) out vec3 norm_out;
-layout(location = 1) out flat uint mat_id_out;
+//layout(location = 1) out flat uint mat_id_out;
 
 vec4 transform_point(in Motor q, in vec4 p) {
     vec3 a = cross(q.v.xyz, p.xyz) + (q.m.xyz * p.w);
@@ -29,6 +29,6 @@ vec4 transform_point(in Motor q, in vec4 p) {
 
 void main() {
     gl_Position = push_data.proj * transform_point(push_data.cam, transform_point(push_data.obj, vec4(pos, 1.0)));
-    norm_out = norm;
-    mat_id_out = data.x;
+    norm_out = normalize(transform_point(push_data.cam, transform_point(push_data.obj, vec4(norm, 0.0))).xyz);
+    //mat_id_out = data.x;
 }

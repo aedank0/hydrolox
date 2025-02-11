@@ -3,9 +3,13 @@ use std::{error::Error, fmt::Display};
 use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
 use serde_yml as yml;
-use winit::{event::{ElementState, KeyEvent, MouseButton}, keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey, SmolStr}};
+use winit::{
+    event::{ElementState, KeyEvent, MouseButton},
+    keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey, SmolStr},
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[repr(u16)]
 pub enum Action {
     PrimaryInteract,
     SecondaryInteract,
@@ -18,8 +22,12 @@ impl Action {
             BindOut::PrimaryInteract => Some(Self::PrimaryInteract),
             BindOut::SecondaryInteract => Some(Self::SecondaryInteract),
             BindOut::Pause => Some(Self::Pause),
-            _ => None
+            _ => None,
         }
+    }
+    pub fn discriminant(&self) -> u16 {
+        //Safe according to https://doc.rust-lang.org/std/mem/fn.discriminant.html#accessing-the-numeric-value-of-the-discriminant
+        unsafe { *<*const _>::from(self).cast::<u16>() }
     }
 }
 
@@ -70,7 +78,7 @@ impl From<std::io::Error> for BindsErr {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Bindings (AHashMap<BindType, BindOut>);
+struct Bindings(AHashMap<BindType, BindOut>);
 impl Bindings {
     fn new() -> Result<Self, BindsErr> {
         if let Ok(binds_file) = std::fs::File::open("binds.yaml") {
@@ -88,8 +96,14 @@ impl Bindings {
             (BindType::Key(KeyCode::KeyA), BindOut::MoveLeft),
             (BindType::Key(KeyCode::KeyD), BindOut::MoveRight),
             (BindType::Key(KeyCode::KeyS), BindOut::MoveBack),
-            (BindType::MouseButton(MouseButton::Left), BindOut::PrimaryInteract),
-            (BindType::MouseButton(MouseButton::Right), BindOut::SecondaryInteract),
+            (
+                BindType::MouseButton(MouseButton::Left),
+                BindOut::PrimaryInteract,
+            ),
+            (
+                BindType::MouseButton(MouseButton::Right),
+                BindOut::SecondaryInteract,
+            ),
         ]))
     }
     fn save(&self) -> Result<(), BindsErr> {
@@ -103,11 +117,15 @@ impl Bindings {
 pub struct Input {
     bindings: Bindings,
     current_modifiers: ModifiersState,
-    move_inputs: [bool;4],
+    move_inputs: [bool; 4],
 }
 impl Input {
     pub fn new() -> Result<Self, BindsErr> {
-        Ok(Self { bindings: Bindings::new()?, current_modifiers: ModifiersState::default(), move_inputs: [false;4] })
+        Ok(Self {
+            bindings: Bindings::new()?,
+            current_modifiers: ModifiersState::default(),
+            move_inputs: [false; 4],
+        })
     }
     fn handle_bind_out(&mut self, bind_out: BindOut, state: ElementState) -> Option<Action> {
         if let Some(action) = Action::from_bind_out(bind_out) {
@@ -120,7 +138,7 @@ impl Input {
                 BindOut::MoveLeft => self.move_inputs[1] = state.is_pressed(),
                 BindOut::MoveRight => self.move_inputs[2] = state.is_pressed(),
                 BindOut::MoveBack => self.move_inputs[3] = state.is_pressed(),
-                _ => panic!("Shouldn't happen")
+                _ => panic!("Shouldn't happen"),
             }
         }
         None
@@ -128,16 +146,24 @@ impl Input {
     pub fn handle_key(&mut self, k: KeyEvent) -> Option<Action> {
         let bind_out_maybe = 'blk: {
             match k.logical_key {
-                Key::Named(named) => if let Some(bind_out) = self.bindings.0.get(&BindType::Named(named)) {
-                    break 'blk Some(*bind_out);
-                },
-                Key::Character(ch) => if let Some(bind_out) = self.bindings.0.get(&BindType::Character(ch)) {
-                    break 'blk Some(*bind_out);
+                Key::Named(named) => {
+                    if let Some(bind_out) = self.bindings.0.get(&BindType::Named(named)) {
+                        break 'blk Some(*bind_out);
+                    }
                 }
-                _ => ()
+                Key::Character(ch) => {
+                    if let Some(bind_out) = self.bindings.0.get(&BindType::Character(ch)) {
+                        break 'blk Some(*bind_out);
+                    }
+                }
+                _ => (),
             }
             if let PhysicalKey::Code(kc) = k.physical_key {
-                if let Some(bind_out) = self.bindings.0.get(&BindType::KeyMod(kc, self.current_modifiers)) {
+                if let Some(bind_out) = self
+                    .bindings
+                    .0
+                    .get(&BindType::KeyMod(kc, self.current_modifiers))
+                {
                     break 'blk Some(*bind_out);
                 } else if let Some(bind_out) = self.bindings.0.get(&BindType::Key(kc)) {
                     break 'blk Some(*bind_out);
@@ -150,7 +176,11 @@ impl Input {
         }
         None
     }
-    pub fn handle_mouse_button(&mut self, state: ElementState, button: MouseButton) -> Option<Action> {
+    pub fn handle_mouse_button(
+        &mut self,
+        state: ElementState,
+        button: MouseButton,
+    ) -> Option<Action> {
         if state.is_pressed() {
             if let Some(bind_out) = self.bindings.0.get(&BindType::MouseButton(button)) {
                 return self.handle_bind_out(*bind_out, state);
