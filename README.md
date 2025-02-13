@@ -6,6 +6,8 @@ Hydrolox is written in Rust with shaders written in GLSL, and uses the [Vulkano]
 
 In place of a linear algebra library, I'm trying to code an implementation of 3D Projective Geometric Algebra, which ideally does fewer multiplications than using a 4x4 matrix. It's in a seperate repository: <https://github.com/aedank0/hydrolox-pga3d>.
 
+Hydrolox has switched over to using its own logger, [hydrolox_log](https://github.com/aedank0/hydrolox-log), which can write to a logfile in addition to writing to stdout. The Hydrolox executable uses command line arguments (via [clap](https://github.com/clap-rs/clap)) to control the level of logging and whether it also writes the log to disk.
+
 Some priorities for what I want to do next:
  - [x] Complete and debug rendering system
    - The initial version of the rendering system is now implemented, though it still needs to be tested
@@ -27,6 +29,8 @@ Some priorities for what I want to do next:
    - The basic system is in place, more bindings will be added as needed when development on the actual game begins
  - [x] Refactor the way core systems are initialized
    - Currently core systems have duplicate code for creating themselves and spawning their threads, this code should be moved to a generic implementation on the System trait
+ - [ ] Add more and better logging
+   - Should use log's target to show which system/process the log comes from
  - [ ] Implement a basic physics process and components
  - [ ] Implement player: Movement, ability to interact with objects, etc.
     - Basic player input and movement is implemented, although it's a simplified version more for testing underlying systems

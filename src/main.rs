@@ -9,6 +9,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+use clap::Parser;
 use framework::Components;
 use game::{Game, GameError, GameMessage};
 use input::Input;
@@ -297,8 +298,24 @@ impl ApplicationHandler for App {
     }
 }
 
+#[derive(Debug, Parser)]
+#[command(version, about)]
+struct CliArgs {
+    /// Minimum log level
+    #[arg(short, long, default_value_t = log::LevelFilter::Off)]
+    log_level: log::LevelFilter,
+
+    /// Output logs to logfile
+    #[arg(short, long, default_value_t = false)]
+    write_logfile: bool,
+}
+
 fn main() -> ExitCode {
-    env_logger::init();
+    let args = CliArgs::parse();
+    if let Err(err) = hydrolox_log::init(args.log_level, args.write_logfile) {
+        eprintln!("Failed to initialize log: {err}");
+        return ExitCode::FAILURE;
+    }
 
     info!("Starting Hydrolox");
     info!("Hello World!");

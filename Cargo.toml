@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 ahash = { version = "0.8", features = ["serde"] }
-env_logger = "0.11"
+hydrolox-log = { git = "https://github.com/aedank0/hydrolox-log.git"}
 log = "0.4"
 hydrolox-pga3d = { git = "https://github.com/aedank0/hydrolox-pga3d.git", features = ["serde", "bytemuck"]}
 smallvec = { version = "1.0", features = ["const_generics", "const_new", "serde"] }
@@ -17,6 +17,7 @@ serde = { version = "1.0", features = ["derive"] }
 bytemuck = { version = "1.0", features = ["derive"] }
 serde_yml = "0.0.12"
 tobj = "4.0"
+clap = { version = "4.5.29", features = ["derive"] }
 
 [profile.release]
 codegen-units = 1

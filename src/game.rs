@@ -221,7 +221,10 @@ impl Process for Player {
                 Action::Look(x, y) => {
                     self.look_rot.0 += x * self.look_speed * STEP_PERIOD;
                     self.look_rot.1 += y * self.look_speed * STEP_PERIOD;
-                    self.look_rot.1 = self.look_rot.1.clamp((-80.0f32).to_radians(), (80.0f32).to_radians());
+                    self.look_rot.1 = self
+                        .look_rot
+                        .1
+                        .clamp((-80.0f32).to_radians(), (80.0f32).to_radians());
 
                     let mut transforms = components.transforms.write().unwrap();
                     let motor = &mut transforms.get_mut(self.player_entity).unwrap().motor;
