@@ -1063,6 +1063,7 @@ impl System for Render {
                             mesh_id
                         }
                     };
+                    self.meshes.get_mut(&id).unwrap().entities.push(e);
                     instance.mesh_id = Some(id);
                 }
                 if instance.material_id.is_none() {
@@ -1150,7 +1151,9 @@ impl System for Render {
                     .get(e)
                     .unwrap()
                     .clone();
-                let inv_cam = cam_transform.global_motor(&self.components).inverse();
+                let inv_cam = cam_transform
+                    .global_motor(&self.components.transforms.read().unwrap())
+                    .inverse();
                 let proj_factor = 1.0 / (cam.fov * 0.5).tan();
 
                 let (img_index, suboptimal, acquire_future) =
@@ -1201,7 +1204,7 @@ impl System for Render {
                                 [self.inverse_aspect_ratio * proj_factor, 0.0, 0.0, 0.0],
                                 [0.0, -proj_factor, 0.0, 0.0],
                                 [0.0, 0.0, 0.0, -1.0],
-                                [0.0, 0.0, cam.near_plane, 1.0],
+                                [0.0, 0.0, cam.near_plane, 0.0],
                             ],
                             cam: inv_cam,
                         },
@@ -1228,7 +1231,7 @@ impl System for Render {
                                         .expect(&format!(
                                             "Expected tranform of entity {e} in render"
                                         ))
-                                        .motor,
+                                        .global_motor(&transforms),
                                 )?;
                                 unsafe {
                                     builder.draw_indexed(
