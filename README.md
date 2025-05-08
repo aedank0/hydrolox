@@ -35,3 +35,5 @@ Some priorities for what I want to do next:
  - [ ] Implement player: Movement, ability to interact with objects, etc.
     - Basic player input and movement is implemented, although it's a simplified version more for testing underlying systems
  - [ ] Implement advanced rendering: Skybox, spotlights, point lights, shadows, transparency, texturing
+ - [x] Integrate egui for UI
+ - [ ] Integrate FMOD for audio

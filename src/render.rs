@@ -4,26 +4,27 @@ use std::{
     fmt::{Debug, Display},
     fs::File,
     mem::{offset_of, size_of},
-    num::NonZeroU64,
-    sync::{mpsc::Receiver, Arc, RwLock},
+    num::{NonZeroU16, NonZeroU64},
+    sync::{mpsc::Receiver, Arc, RwLock}, time::{Duration, Instant},
 };
 
 use ahash::AHashMap;
 use bytemuck::{Pod, Zeroable};
+use egui::TextureId;
 use hydrolox_pga3d::prelude as pga;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_yml as yml;
-use smallvec::smallvec;
+use smallvec::{smallvec, SmallVec};
 use vulkano::{
     buffer::{
         AllocateBufferError, Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer,
     },
     command_buffer::{
         allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
-        AutoCommandBufferBuilder, CommandBufferExecError, CommandBufferExecFuture,
-        CommandBufferUsage, CopyBufferInfo, CopyBufferInfoTyped, PrimaryCommandBufferAbstract,
-        RenderPassBeginInfo, SubpassBeginInfo, SubpassEndInfo,
+        AutoCommandBufferBuilder, BufferImageCopy, CommandBufferExecError, CommandBufferExecFuture,
+        CommandBufferUsage, CopyBufferInfo, CopyBufferInfoTyped, CopyBufferToImageInfo,
+        PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassBeginInfo, SubpassEndInfo,
     },
     descriptor_set::{
         allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo},
@@ -39,27 +40,32 @@ use vulkano::{
     },
     format::{ClearValue, Format},
     image::{
-        view::ImageView, AllocateImageError, Image, ImageAspects, ImageCreateInfo, ImageLayout,
-        ImageTiling, ImageUsage,
+        sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode},
+        view::ImageView,
+        AllocateImageError, Image, ImageAspects, ImageCreateInfo, ImageLayout,
+        ImageSubresourceLayers, ImageTiling, ImageType, ImageUsage,
     },
     instance::{Instance, InstanceCreateInfo},
     memory::allocator::{
-        AllocationCreateInfo, GenericMemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator,
+        AllocationCreateInfo, BumpAllocator, GenericMemoryAllocator,
+        GenericMemoryAllocatorCreateInfo, MemoryTypeFilter, StandardMemoryAllocator,
     },
     pipeline::{
         graphics::{
-            color_blend::{ColorBlendAttachmentState, ColorBlendState},
+            color_blend::{
+                AttachmentBlend, BlendFactor, ColorBlendAttachmentState, ColorBlendState,
+            },
             depth_stencil::{CompareOp, DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
             multisample::MultisampleState,
             rasterization::{CullMode, RasterizationState},
             subpass::PipelineSubpassType,
             vertex_input::{Vertex, VertexDefinition, VertexInputState},
-            viewport::{Viewport, ViewportState},
+            viewport::{Scissor, Viewport, ViewportState},
             GraphicsPipelineCreateInfo,
         },
         layout::{PipelineLayoutCreateInfo, PushConstantRange},
-        GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+        DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
         PipelineShaderStageCreateInfo,
     },
     render_pass::{
@@ -70,20 +76,17 @@ use vulkano::{
     shader::ShaderStages,
     swapchain::{
         acquire_next_image, FromWindowError, PresentFuture, PresentMode, Surface, SurfaceInfo,
-        Swapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo,
+        Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
     },
     sync::{
-        future::{FenceSignalFuture, JoinFuture, NowFuture},
-        AccessFlags, DependencyFlags, GpuFuture, PipelineStages, Sharing,
+        future::FenceSignalFuture, AccessFlags, DependencyFlags, GpuFuture, PipelineStages, Sharing,
     },
     LoadingError, Validated, ValidationError, VulkanError, VulkanLibrary,
 };
 use winit::{raw_window_handle::HandleError, window::Window};
 
 use crate::{
-    framework::{Component, Components, Entity},
-    input::Input,
-    System, SystemMessage,
+    framework::{Component, Components, Entity}, geometry::*, input::Input, timer::Timer, System, SystemMessage
 };
 
 mod shader {
@@ -114,6 +117,20 @@ mod shader {
             vulkano_shaders::shader! {
                 ty: "fragment",
                 path: "src/shader/defer_fs.glsl"
+            }
+        }
+    }
+    pub mod ui {
+        pub mod vs {
+            vulkano_shaders::shader! {
+                ty: "vertex",
+                path: "src/shader/ui_vs.glsl"
+            }
+        }
+        pub mod fs {
+            vulkano_shaders::shader! {
+                ty: "fragment",
+                path: "src/shader/ui_fs.glsl"
             }
         }
     }
@@ -224,22 +241,6 @@ impl From<HandleError> for RenderError {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, BufferContents)]
-#[repr(C)]
-struct Vec3 {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-}
-impl Vec3 {
-    const fn new(x: f32, y: f32, z: f32) -> Self {
-        Self { x, y, z }
-    }
-    const fn from_val(v: f32) -> Self {
-        Self { x: v, y: v, z: v }
-    }
-}
-
 #[derive(Debug, Default, Clone, Copy, BufferContents, Vertex)]
 #[repr(C)]
 struct VertexData {
@@ -260,26 +261,42 @@ impl VertexData {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, BufferContents)]
+#[derive(Debug, Default, Clone, Copy, BufferContents, Vertex)]
 #[repr(C)]
-struct RGBA {
-    pub r: u8,
-    pub b: u8,
-    pub g: u8,
-    pub a: u8,
+struct UIVertData {
+    #[format(R32G32_SFLOAT)]
+    pub pos: [f32; 2],
+    #[format(R16G16_UNORM)]
+    pub uv: [u16; 2],
+    #[format(R8G8B8A8_UNORM)]
+    pub color: [u8; 4],
 }
-impl RGBA {
-    const fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
-        Self { r, b, g, a }
+impl From<&egui::epaint::Vertex> for UIVertData {
+    fn from(value: &egui::epaint::Vertex) -> Self {
+        Self {
+            pos: [value.pos.x, value.pos.y],
+            uv: [
+                (value.uv.x * u16::MAX as f32) as u16,
+                (value.uv.y * u16::MAX as f32) as u16,
+            ],
+            color: value.color.to_array(),
+        }
     }
 }
 
-use shader::fore::fs::Material;
 use shader::fore::vs::PushData;
+use shader::{fore::fs::Material, ui};
+
+#[derive(Debug)]
+pub struct UpdateUI {
+    pub textures_delta: egui::TexturesDelta,
+    pub primitives: Vec<egui::ClippedPrimitive>,
+}
 
 #[derive(Debug)]
 pub enum RenderMessage {
     Stop,
+    UpdateUI(UpdateUI),
 }
 impl SystemMessage for RenderMessage {
     fn stop_msg() -> Self {
@@ -294,6 +311,7 @@ pub struct RenderInit {
     pub window: Arc<Window>,
     pub res_x: u16,
     pub res_y: u16,
+    pub max_framerate: Option<NonZeroU16>,
 }
 
 fn new_basic_image(
@@ -329,6 +347,20 @@ struct MeshData {
 struct MatData {
     //buffer: Subbuffer<Material>,
     desc_set: Arc<DescriptorSet>,
+}
+
+#[derive(Debug)]
+struct UIBufferData {
+    verts: Subbuffer<[UIVertData]>,
+    idxs: Subbuffer<[u32]>,
+    clip: egui::Rect,
+}
+
+#[derive(Debug)]
+struct UIMatData {
+    image: Arc<Image>,
+    desc_set: Arc<DescriptorSet>,
+    buffers: Vec<UIBufferData>,
 }
 
 /*
@@ -375,6 +407,8 @@ pub struct Render {
 
     inverse_aspect_ratio: f32,
 
+    min_frame_period: Option<Duration>,
+
     //instance: Arc<Instance>,
     device: Arc<Device>,
     graphics_queue: Arc<Queue>,
@@ -407,6 +441,12 @@ pub struct Render {
     next_mat_id: NonZeroU64,
     mat_buffer: Subbuffer<[Material]>,
     materials: AHashMap<NonZeroU64, MatData>,
+
+    ui_allocator: Arc<GenericMemoryAllocator<BumpAllocator>>,
+    ui_tex_desc_set_layout: Arc<DescriptorSetLayout>,
+    ui_static_desc_set: Arc<DescriptorSet>,
+    ui_pipeline: Arc<GraphicsPipeline>,
+    ui_mats: AHashMap<u64, UIMatData>,
 }
 impl System for Render {
     type Init = RenderInit;
@@ -420,6 +460,7 @@ impl System for Render {
             window,
             res_x,
             res_y,
+            max_framerate,
         }: RenderInit,
         receiver: Receiver<RenderMessage>,
     ) -> Result<Self, RenderError> {
@@ -450,6 +491,8 @@ impl System for Render {
             .surface_formats(&surface, SurfaceInfo::default())?
             .first()
             .ok_or(RenderError::NoSrfFormats)?;
+
+        log::info!("Surface format is: {:#?}", srf_fmt);
 
         let graphics_queue_fam_id = phys_device.queue_family_properties().iter().enumerate().find_map(|(id, fam)| {
             if fam.queue_flags.contains(QueueFlags::GRAPHICS) && match phys_device.surface_support(id as u32, &surface) {
@@ -657,19 +700,40 @@ impl System for Render {
                         })],
                         ..Default::default()
                     },
+                    //UI
+                    SubpassDescription {
+                        color_attachments: vec![Some(AttachmentReference {
+                            attachment: 4,
+                            layout: ImageLayout::ColorAttachmentOptimal,
+                            ..Default::default()
+                        })],
+                        ..Default::default()
+                    },
                 ],
-                dependencies: vec![SubpassDependency {
-                    src_subpass: Some(0),
-                    dst_subpass: Some(1),
-                    src_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT
-                        | PipelineStages::LATE_FRAGMENT_TESTS,
-                    dst_stages: PipelineStages::FRAGMENT_SHADER,
-                    src_access: AccessFlags::COLOR_ATTACHMENT_WRITE
-                        | AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    dst_access: AccessFlags::INPUT_ATTACHMENT_READ,
-                    dependency_flags: DependencyFlags::BY_REGION,
-                    ..Default::default()
-                }],
+                dependencies: vec![
+                    SubpassDependency {
+                        src_subpass: Some(0),
+                        dst_subpass: Some(1),
+                        src_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT
+                            | PipelineStages::LATE_FRAGMENT_TESTS,
+                        dst_stages: PipelineStages::FRAGMENT_SHADER,
+                        src_access: AccessFlags::COLOR_ATTACHMENT_WRITE
+                            | AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                        dst_access: AccessFlags::INPUT_ATTACHMENT_READ,
+                        dependency_flags: DependencyFlags::BY_REGION,
+                        ..Default::default()
+                    },
+                    SubpassDependency {
+                        src_subpass: Some(1),
+                        dst_subpass: Some(2),
+                        src_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+                        dst_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+                        src_access: AccessFlags::COLOR_ATTACHMENT_WRITE,
+                        dst_access: AccessFlags::COLOR_ATTACHMENT_READ,
+                        dependency_flags: DependencyFlags::BY_REGION,
+                        ..Default::default()
+                    },
+                ],
                 ..Default::default()
             },
         )?;
@@ -900,9 +964,145 @@ impl System for Render {
             1024,
         )?;
 
+        let ui_allocator = Arc::new(GenericMemoryAllocator::<BumpAllocator>::new(
+            device.clone(),
+            GenericMemoryAllocatorCreateInfo {
+                block_sizes: &vec![2 << 20; phys_device.memory_properties().memory_types.len()],
+                ..Default::default()
+            },
+        ));
+        let ui_static_desc_set_layout = DescriptorSetLayout::new(
+            device.clone(),
+            DescriptorSetLayoutCreateInfo {
+                bindings: [(
+                    0,
+                    DescriptorSetLayoutBinding {
+                        stages: ShaderStages::VERTEX,
+                        ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+        )?;
+        let ui_tex_desc_set_layout = DescriptorSetLayout::new(
+            device.clone(),
+            DescriptorSetLayoutCreateInfo {
+                bindings: [(
+                    0,
+                    DescriptorSetLayoutBinding {
+                        stages: ShaderStages::FRAGMENT,
+                        ..DescriptorSetLayoutBinding::descriptor_type(
+                            DescriptorType::CombinedImageSampler,
+                        )
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+        )?;
+
+        let staging_buf = Buffer::from_data(
+            alloc.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_SRC,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            [res_x as f32, res_y as f32],
+        )?;
+        let ui_res_buf = Buffer::new_sized::<[f32; 2]>(
+            alloc.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::TRANSFER_DST | BufferUsage::UNIFORM_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo::default(),
+        )?;
+        let mut cb_builder = AutoCommandBufferBuilder::primary(
+            cmd_buffer_alloc.clone(),
+            transfer_queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )?;
+        cb_builder.copy_buffer(CopyBufferInfo::buffers(staging_buf, ui_res_buf.clone()))?;
+
+        let fence = cb_builder
+            .build()?
+            .execute(transfer_queue.clone())?
+            .then_signal_fence_and_flush()?;
+
+        let ui_static_desc_set = DescriptorSet::new(
+            desc_set_alloc.clone(),
+            ui_static_desc_set_layout.clone(),
+            [WriteDescriptorSet::buffer(0, ui_res_buf)],
+            [],
+        )?;
+
+        let ui_pipeline_layout = PipelineLayout::new(
+            device.clone(),
+            PipelineLayoutCreateInfo {
+                set_layouts: vec![ui_static_desc_set_layout, ui_tex_desc_set_layout.clone()],
+                ..Default::default()
+            },
+        )?;
+
+        let ui_vs_entry = shader::ui::vs::load(device.clone())?
+            .single_entry_point()
+            .ok_or(RenderError::BadShaderEntry)?;
+        let ui_fs_entry = shader::ui::fs::load(device.clone())?
+            .single_entry_point()
+            .ok_or(RenderError::BadShaderEntry)?;
+
+        let ui_pipeline = GraphicsPipeline::new(
+            device.clone(),
+            None,
+            GraphicsPipelineCreateInfo {
+                stages: smallvec![
+                    PipelineShaderStageCreateInfo::new(ui_vs_entry.clone()),
+                    PipelineShaderStageCreateInfo::new(ui_fs_entry),
+                ],
+                vertex_input_state: Some([UIVertData::per_vertex()].definition(&ui_vs_entry)?),
+                input_assembly_state: Some(InputAssemblyState::default()),
+                viewport_state: Some(ViewportState {
+                    viewports: smallvec![Viewport {
+                        extent: [res_x as f32, res_y as f32],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                rasterization_state: Some(RasterizationState {
+                    cull_mode: CullMode::None,
+                    ..Default::default()
+                }),
+                multisample_state: Some(MultisampleState::default()),
+                color_blend_state: Some(ColorBlendState::with_attachment_states(
+                    1,
+                    ColorBlendAttachmentState {
+                        blend: Some(AttachmentBlend {
+                            dst_color_blend_factor: BlendFactor::OneMinusSrcAlpha,
+                            dst_alpha_blend_factor: BlendFactor::OneMinusSrcAlpha,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )),
+                dynamic_state: [DynamicState::Scissor].into_iter().collect(),
+                subpass: Some(PipelineSubpassType::BeginRenderPass(
+                    Subpass::from(render_pass.clone(), 2).unwrap(),
+                )),
+                ..GraphicsPipelineCreateInfo::layout(ui_pipeline_layout)
+            },
+        )?;
+
+        fence.wait(None)?;
+
         Ok(Self {
             receiver,
             inverse_aspect_ratio: res_y as f32 / res_x as f32,
+            min_frame_period: max_framerate.map(|fr| Duration::from_secs_f32((fr.get() as f32).recip())),
             device,
             graphics_queue,
             transfer_queue,
@@ -923,21 +1123,36 @@ impl System for Render {
             next_mat_id: NonZeroU64::new(1).unwrap(),
             mat_buffer,
             materials: AHashMap::default(),
+
+            ui_allocator,
+            ui_tex_desc_set_layout,
+            ui_static_desc_set,
+            ui_pipeline,
+            ui_mats: AHashMap::default(),
         })
     }
     fn run(&mut self) -> Result<(), RenderError> {
         let mut prev_fence: Option<
-            FenceSignalFuture<
-                PresentFuture<
-                    CommandBufferExecFuture<JoinFuture<NowFuture, SwapchainAcquireFuture>>,
-                >,
-            >,
+            FenceSignalFuture<PresentFuture<CommandBufferExecFuture<Box<dyn GpuFuture>>>>,
         > = None;
 
+        let mut ui_updates = SmallVec::<[UpdateUI;1]>::new();
+        let mut next_time = Instant::now();
+        log::debug!("{:#?}", self.min_frame_period);
         loop {
+            if let Some(frame_period) = self.min_frame_period {
+                let now = Instant::now();
+                if let Some(to_sleep) = next_time.checked_duration_since(now) {
+                    std::thread::sleep(to_sleep);
+                }
+                next_time = now + frame_period;
+            }
+            log::trace!("frame start");
+            ui_updates.clear();
             for msg in self.receiver.try_iter() {
                 match msg {
                     RenderMessage::Stop => return Ok(()),
+                    RenderMessage::UpdateUI(update_ui) => ui_updates.push(update_ui),
                 }
             }
 
@@ -1135,6 +1350,287 @@ impl System for Render {
                 fence.wait(None)?;
             }
 
+            let ui_fence = if !ui_updates.is_empty() {
+                let mut cb_builder = AutoCommandBufferBuilder::primary(
+                    self.cmd_buffer_alloc.clone(),
+                    self.transfer_queue.queue_family_index(),
+                    CommandBufferUsage::OneTimeSubmit,
+                )?;
+
+                for ui_update in &ui_updates {
+                    if !ui_update.textures_delta.is_empty() {
+                        for (tex_id, img_delta) in &ui_update.textures_delta.set {
+                            let tex_id = match tex_id {
+                                TextureId::Managed(v) => *v,
+                                TextureId::User(_) => {
+                                    unimplemented!("User texture ids not supported")
+                                }
+                            };
+                            let entry = match self.ui_mats.entry(tex_id) {
+                                Entry::Vacant(v) => {
+                                    let format = Format::R8G8B8A8_SRGB;
+                                    let image = Image::new(
+                                        self.allocator.clone(),
+                                        ImageCreateInfo {
+                                            image_type: ImageType::Dim2d,
+                                            format,
+                                            view_formats: vec![format],
+                                            extent: [
+                                                img_delta.image.width() as u32,
+                                                img_delta.image.height() as u32,
+                                                1,
+                                            ],
+                                            usage: ImageUsage::SAMPLED | ImageUsage::TRANSFER_DST,
+                                            ..Default::default()
+                                        },
+                                        AllocationCreateInfo::default(),
+                                    )?;
+                                    let view = ImageView::new_default(image.clone())?;
+                                    let sampler = Sampler::new(
+                                        self.device.clone(),
+                                        SamplerCreateInfo {
+                                            mag_filter: match img_delta.options.magnification {
+                                                egui::TextureFilter::Nearest => Filter::Nearest,
+                                                egui::TextureFilter::Linear => Filter::Linear,
+                                            },
+                                            min_filter: match img_delta.options.minification {
+                                                egui::TextureFilter::Nearest => Filter::Nearest,
+                                                egui::TextureFilter::Linear => Filter::Linear,
+                                            },
+                                            mipmap_mode: match img_delta
+                                                .options
+                                                .mipmap_mode
+                                                .unwrap_or(egui::TextureFilter::Nearest)
+                                            {
+                                                egui::TextureFilter::Nearest => {
+                                                    SamplerMipmapMode::Nearest
+                                                }
+                                                egui::TextureFilter::Linear => {
+                                                    SamplerMipmapMode::Linear
+                                                }
+                                            },
+                                            address_mode: [match img_delta.options.wrap_mode {
+                                                egui::TextureWrapMode::ClampToEdge => {
+                                                    SamplerAddressMode::ClampToEdge
+                                                }
+                                                egui::TextureWrapMode::Repeat => {
+                                                    SamplerAddressMode::Repeat
+                                                }
+                                                egui::TextureWrapMode::MirroredRepeat => {
+                                                    SamplerAddressMode::MirroredRepeat
+                                                }
+                                            };
+                                                3],
+                                            ..Default::default()
+                                        },
+                                    )?;
+
+                                    let desc_set = DescriptorSet::new(
+                                        self.desc_set_alloc.clone(),
+                                        self.ui_tex_desc_set_layout.clone(),
+                                        [WriteDescriptorSet::image_view_sampler(0, view, sampler)],
+                                        [],
+                                    )?;
+                                    v.insert_entry(UIMatData {
+                                        image,
+                                        desc_set,
+                                        buffers: Vec::new(),
+                                    })
+                                }
+                                Entry::Occupied(o) => o,
+                            };
+
+                            let staging_buf = match &img_delta.image {
+                                egui::ImageData::Color(img) => Buffer::from_iter(
+                                    self.allocator.clone(),
+                                    BufferCreateInfo {
+                                        usage: BufferUsage::TRANSFER_SRC,
+                                        ..Default::default()
+                                    },
+                                    AllocationCreateInfo {
+                                        memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                                        ..Default::default()
+                                    },
+                                    img.pixels.iter().copied(),
+                                )?,
+                                egui::ImageData::Font(img) => Buffer::from_iter(
+                                    self.allocator.clone(),
+                                    BufferCreateInfo {
+                                        usage: BufferUsage::TRANSFER_SRC,
+                                        ..Default::default()
+                                    },
+                                    AllocationCreateInfo {
+                                        memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                                        ..Default::default()
+                                    },
+                                    img.srgba_pixels(None),
+                                )?,
+                            };
+
+                            let mut copy_info = CopyBufferToImageInfo::buffer_image(
+                                staging_buf,
+                                entry.get().image.clone(),
+                            );
+                            if let Some(region) = img_delta.pos {
+                                copy_info.regions[0] = BufferImageCopy {
+                                    buffer_row_length: img_delta.image.width() as u32,
+                                    buffer_image_height: img_delta.image.height() as u32,
+                                    image_subresource: ImageSubresourceLayers::from_parameters(
+                                        entry.get().image.format(),
+                                        1,
+                                    ),
+                                    image_offset: [region[0] as u32, region[1] as u32, 0],
+                                    image_extent: [
+                                        img_delta.image.width() as u32,
+                                        img_delta.image.height() as u32,
+                                        1,
+                                    ],
+                                    ..Default::default()
+                                };
+                            }
+                            cb_builder.copy_buffer_to_image(copy_info)?;
+                        }
+                    }
+
+                    for ui_mat in self.ui_mats.values_mut() {
+                        ui_mat.buffers.clear();
+                    }
+
+                    for primitive in &ui_update.primitives {
+                        match &primitive.primitive {
+                            egui::epaint::Primitive::Mesh(mesh) => {
+                                let ui_mat = self.ui_mats.get_mut(match &mesh.texture_id {
+                                    egui::epaint::TextureId::Managed(v) => v,
+                                    egui::epaint::TextureId::User(_) => unimplemented!(),
+                                });
+                                if ui_mat.is_none() {
+                                    log::warn!(
+                                        "UI Material id \"{:#?}\" not found, skipping mesh",
+                                        mesh.texture_id
+                                    );
+                                    continue;
+                                }
+                                let ui_mat = ui_mat.unwrap();
+
+                                let vert_staging = Buffer::from_iter(
+                                    self.ui_allocator.clone(),
+                                    BufferCreateInfo {
+                                        usage: BufferUsage::TRANSFER_SRC,
+                                        ..Default::default()
+                                    },
+                                    AllocationCreateInfo {
+                                        memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                                        ..Default::default()
+                                    },
+                                    mesh.vertices.iter().map(|v| UIVertData::from(v)),
+                                )?;
+
+                                let verts = Buffer::new_slice::<UIVertData>(
+                                    self.ui_allocator.clone(),
+                                    BufferCreateInfo {
+                                        usage: BufferUsage::VERTEX_BUFFER
+                                            | BufferUsage::TRANSFER_DST,
+                                        ..Default::default()
+                                    },
+                                    AllocationCreateInfo::default(),
+                                    vert_staging.len(),
+                                )?;
+
+                                cb_builder.copy_buffer(CopyBufferInfoTyped::buffers(
+                                    vert_staging,
+                                    verts.clone(),
+                                ))?;
+
+                                let idx_staging = Buffer::from_iter(
+                                    self.ui_allocator.clone(),
+                                    BufferCreateInfo {
+                                        usage: BufferUsage::TRANSFER_SRC,
+                                        ..Default::default()
+                                    },
+                                    AllocationCreateInfo {
+                                        memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                                        ..Default::default()
+                                    },
+                                    mesh.indices.iter().copied(),
+                                )?;
+
+                                let idxs = Buffer::new_slice::<u32>(
+                                    self.ui_allocator.clone(),
+                                    BufferCreateInfo {
+                                        usage: BufferUsage::INDEX_BUFFER
+                                            | BufferUsage::TRANSFER_DST,
+                                        ..Default::default()
+                                    },
+                                    AllocationCreateInfo::default(),
+                                    idx_staging.len(),
+                                )?;
+
+                                cb_builder.copy_buffer(CopyBufferInfoTyped::buffers(
+                                    idx_staging,
+                                    idxs.clone(),
+                                ))?;
+
+                                ui_mat.buffers.push(UIBufferData {
+                                    verts,
+                                    idxs,
+                                    clip: primitive.clip_rect,
+                                });
+                            }
+                            egui::epaint::Primitive::Callback(_cb) => unimplemented!(),
+                        }
+                    }
+                }
+
+                Some(
+                    cb_builder
+                        .build()?
+                        .execute(self.transfer_queue.clone())?
+                        .then_signal_fence_and_flush()?,
+                )
+            } else {
+                None
+            };
+
+            let (img_index, suboptimal, acquire_future) =
+                match acquire_next_image(self.swapchain.clone(), None) {
+                    Ok(res) => res,
+                    Err(v_err) => match v_err {
+                        Validated::ValidationError(e) => return Err(e.into()),
+                        Validated::Error(e) => match e {
+                            VulkanError::OutOfDate => {
+                                todo!();
+                            }
+                            other_err => return Err(other_err.into()),
+                        },
+                    },
+                };
+
+            if suboptimal {
+                log::warn!("Suboptimal swapchain");
+            }
+
+            let mut builder = AutoCommandBufferBuilder::primary(
+                self.cmd_buffer_alloc.clone(),
+                self.graphics_queue.queue_family_index(),
+                CommandBufferUsage::OneTimeSubmit,
+            )?;
+
+            builder.begin_render_pass(
+                RenderPassBeginInfo {
+                    clear_values: vec![
+                        Some(ClearValue::Float([0.0, 0.0, 1.0, 1.0])),
+                        Some(ClearValue::Float([0.0, 0.0, 0.0, 0.0])),
+                        Some(ClearValue::Float([0.0, 0.0, 0.0, 0.0])),
+                        Some(ClearValue::Depth(0.0)),
+                        Some(ClearValue::Float([1.0, 0.0, 0.0, 1.0])),
+                    ],
+                    ..RenderPassBeginInfo::framebuffer(
+                        self.framebuffers[img_index as usize].clone(),
+                    )
+                },
+                SubpassBeginInfo::default(),
+            )?;
+
             let maybe_cam_data = self
                 .components
                 .cameras
@@ -1156,45 +1652,7 @@ impl System for Render {
                     .inverse();
                 let proj_factor = 1.0 / (cam.fov * 0.5).tan();
 
-                let (img_index, suboptimal, acquire_future) =
-                    match acquire_next_image(self.swapchain.clone(), None) {
-                        Ok(res) => res,
-                        Err(v_err) => match v_err {
-                            Validated::ValidationError(e) => return Err(e.into()),
-                            Validated::Error(e) => match e {
-                                VulkanError::OutOfDate => {
-                                    todo!();
-                                }
-                                other_err => return Err(other_err.into()),
-                            },
-                        },
-                    };
-
-                if suboptimal {
-                    log::warn!("Suboptimal swapchain");
-                }
-
-                let mut builder = AutoCommandBufferBuilder::primary(
-                    self.cmd_buffer_alloc.clone(),
-                    self.graphics_queue.queue_family_index(),
-                    CommandBufferUsage::OneTimeSubmit,
-                )?;
                 builder
-                    .begin_render_pass(
-                        RenderPassBeginInfo {
-                            clear_values: vec![
-                                Some(ClearValue::Float([0.0, 0.0, 1.0, 1.0])),
-                                Some(ClearValue::Float([0.0, 0.0, 0.0, 0.0])),
-                                Some(ClearValue::Float([0.0, 0.0, 0.0, 0.0])),
-                                Some(ClearValue::Depth(0.0)),
-                                Some(ClearValue::Float([1.0, 0.0, 0.0, 1.0])),
-                            ],
-                            ..RenderPassBeginInfo::framebuffer(
-                                self.framebuffers[img_index as usize].clone(),
-                            )
-                        },
-                        SubpassBeginInfo::default(),
-                    )?
                     .bind_pipeline_graphics(self.fore_pipeline.clone())?
                     .push_constants(
                         self.fore_pipeline.layout().clone(),
@@ -1246,34 +1704,84 @@ impl System for Render {
                         }
                     }
                 }
-                builder
-                    .next_subpass(SubpassEndInfo::default(), SubpassBeginInfo::default())?
-                    .bind_pipeline_graphics(self.defer_pipeline.clone())?
-                    .bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        self.defer_pipeline.layout().clone(),
-                        0,
-                        self.defer_desc_set.clone(),
-                    )?;
-                unsafe {
-                    builder.draw(3, 1, 0, 0)?;
-                }
-                builder.end_render_pass(SubpassEndInfo::default())?;
+            }
+            builder
+                .next_subpass(SubpassEndInfo::default(), SubpassBeginInfo::default())?
+                .bind_pipeline_graphics(self.defer_pipeline.clone())?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    self.defer_pipeline.layout().clone(),
+                    0,
+                    self.defer_desc_set.clone(),
+                )?;
+            unsafe {
+                builder.draw(3, 1, 0, 0)?;
+            }
 
-                let cb = builder.build()?;
-                prev_fence = Some(
-                    vulkano::sync::now(self.device.clone())
-                        .join(acquire_future)
-                        .then_execute(self.graphics_queue.clone(), cb)?
-                        .then_swapchain_present(
-                            self.graphics_queue.clone(),
-                            SwapchainPresentInfo::swapchain_image_index(
-                                self.swapchain.clone(),
-                                img_index,
-                            ),
-                        )
-                        .then_signal_fence_and_flush()?,
-                );
+            builder
+                .next_subpass(SubpassEndInfo::default(), SubpassBeginInfo::default())?
+                .bind_pipeline_graphics(self.ui_pipeline.clone())?
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    self.ui_pipeline.layout().clone(),
+                    0,
+                    self.ui_static_desc_set.clone(),
+                )?;
+            for ui_mat in self.ui_mats.values() {
+                builder.bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    self.ui_pipeline.layout().clone(),
+                    1,
+                    ui_mat.desc_set.clone(),
+                )?;
+                for buffers in &ui_mat.buffers {
+                    let scissor = Scissor {
+                        offset: [buffers.clip.min.x as u32, buffers.clip.min.y as u32],
+                        extent: [
+                            (buffers.clip.max.x - buffers.clip.min.x) as u32,
+                            (buffers.clip.max.y - buffers.clip.min.y) as u32,
+                        ],
+                    };
+                    builder
+                        .set_scissor(0, smallvec![scissor])?
+                        .bind_index_buffer(buffers.idxs.clone())?
+                        .bind_vertex_buffers(0, buffers.verts.clone())?;
+                    unsafe {
+                        builder.draw_indexed(buffers.idxs.len() as u32, 1, 0, 0, 0)?;
+                    }
+                }
+            }
+
+            builder.end_render_pass(SubpassEndInfo::default())?;
+
+            let cb = builder.build()?;
+
+            let mut f_tmp: Box<dyn GpuFuture> =
+                Box::new(vulkano::sync::now(self.device.clone()).join(acquire_future));
+            if let Some(ui_fut) = ui_fence {
+                f_tmp = Box::new(f_tmp.join(ui_fut));
+            }
+
+            prev_fence = Some(
+                f_tmp
+                    .then_execute(self.graphics_queue.clone(), cb)?
+                    .then_swapchain_present(
+                        self.graphics_queue.clone(),
+                        SwapchainPresentInfo::swapchain_image_index(
+                            self.swapchain.clone(),
+                            img_index,
+                        ),
+                    )
+                    .then_signal_fence_and_flush()?,
+            );
+
+            for ui_update in &ui_updates {
+                for free_id in &ui_update.textures_delta.free {
+                    match free_id {
+                        TextureId::Managed(id) => self.ui_mats.remove(id),
+                        TextureId::User(_) => unimplemented!(),
+                    };
+                }
             }
         }
     }

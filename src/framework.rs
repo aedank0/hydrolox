@@ -2,17 +2,22 @@ use std::{
     collections::hash_map::{self, Entry},
     fmt::{Debug, Display},
     iter::{FusedIterator, Iterator, Zip},
+    marker::PhantomData,
     num::NonZeroU64,
     sync::RwLock,
     vec,
 };
 
 use ahash::AHashMap;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{
+    de::{Unexpected, Visitor},
+    ser::SerializeMap,
+    Deserialize, Serialize,
+};
 
-use crate::{game, render};
+use crate::{game, physics, render};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct Entity {
     id: NonZeroU64,
@@ -35,13 +40,144 @@ impl Entity {
         }
     }
 }
+impl Serialize for Entity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u64(self.id.get())
+    }
+}
+impl<'de> Deserialize<'de> for Entity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EntityVisitor;
+        impl<'de> Visitor<'de> for EntityVisitor {
+            type Value = Entity;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a positive integer <= 2^64")
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(Entity {
+                    id: NonZeroU64::new(v).ok_or(serde::de::Error::invalid_value(
+                        Unexpected::Unsigned(v),
+                        &"a non-zero value",
+                    ))?,
+                })
+            }
+            fn visit_u8<E>(self, v: u8) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_u64(v as u64)
+            }
+            fn visit_u16<E>(self, v: u16) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_u64(v as u64)
+            }
+            fn visit_u32<E>(self, v: u32) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_u64(v as u64)
+            }
+            fn visit_u128<E>(self, v: u128) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v > u64::MAX as u128 {
+                    Err(serde::de::Error::invalid_value(
+                        Unexpected::Other("integer greater than 2^64"),
+                        &"a non-zero integer <= 2^64",
+                    ))
+                } else {
+                    self.visit_u64(v as u64)
+                }
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v < 0 {
+                    Err(serde::de::Error::invalid_value(
+                        Unexpected::Signed(v),
+                        &"a positive non-zero integer",
+                    ))
+                } else {
+                    self.visit_u64(v as u64)
+                }
+            }
+            fn visit_i8<E>(self, v: i8) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v < 0 {
+                    Err(serde::de::Error::invalid_value(
+                        Unexpected::Signed(v as i64),
+                        &"a positive non-zero integer",
+                    ))
+                } else {
+                    self.visit_u64(v as u64)
+                }
+            }
+            fn visit_i16<E>(self, v: i16) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v < 0 {
+                    Err(serde::de::Error::invalid_value(
+                        Unexpected::Signed(v as i64),
+                        &"a positive non-zero integer",
+                    ))
+                } else {
+                    self.visit_u64(v as u64)
+                }
+            }
+            fn visit_i32<E>(self, v: i32) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v < 0 {
+                    Err(serde::de::Error::invalid_value(
+                        Unexpected::Signed(v as i64),
+                        &"a positive non-zero integer",
+                    ))
+                } else {
+                    self.visit_u64(v as u64)
+                }
+            }
+            fn visit_i128<E>(self, v: i128) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v < 0 {
+                    Err(serde::de::Error::invalid_value(
+                        Unexpected::Other("negative integer"),
+                        &"a positive non-zero integer",
+                    ))
+                } else {
+                    self.visit_u128(v as u128)
+                }
+            }
+        }
+
+        deserializer.deserialize_u64(EntityVisitor)
+    }
+}
 impl Display for Entity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.id)
     }
 }
 
-pub trait Component: 'static + Debug + Serialize + DeserializeOwned {}
+pub trait Component: 'static + Debug {}
 
 #[derive(Debug, Clone)]
 pub struct CompIter<'a, T> {
@@ -117,7 +253,7 @@ where
 impl<T> ExactSizeIterator for CompIterMut<'_, T> where T: Component {}
 impl<T> FusedIterator for CompIterMut<'_, T> where T: Component {}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Comptainer<T> {
     id_to_pos: AHashMap<Entity, usize>,
     comps: Vec<T>,
@@ -137,8 +273,14 @@ impl<T> Comptainer<T>
 where
     T: Component,
 {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
+    }
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            id_to_pos: AHashMap::with_capacity(cap),
+            comps: Vec::with_capacity(cap),
+        }
     }
     pub fn has_component(&self, entity: Entity) -> bool {
         self.id_to_pos.contains_key(&entity)
@@ -214,6 +356,65 @@ where
         }
     }
 }
+impl<T> Serialize for Comptainer<T>
+where
+    T: Component + Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.len()))?;
+        for (e, idx) in &self.id_to_pos {
+            map.serialize_entry(e, &self.comps[*idx])?;
+        }
+        map.end()
+    }
+}
+impl<'de, T> Deserialize<'de> for Comptainer<T>
+where
+    T: Component + Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ComptainerVisitor<T> {
+            marker: PhantomData<fn() -> Comptainer<T>>,
+        }
+        impl<T> ComptainerVisitor<T>
+        where
+            T: Component,
+        {
+            fn new() -> Self {
+                Self {
+                    marker: PhantomData,
+                }
+            }
+        }
+        impl<'de, T> Visitor<'de> for ComptainerVisitor<T>
+        where
+            T: Component + Deserialize<'de>,
+        {
+            type Value = Comptainer<T>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("map of entity ids to components")
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut comptainer = Comptainer::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some((key, value)) = map.next_entry()? {
+                    _ = comptainer.add_component(key, value);
+                }
+
+                Ok(comptainer)
+            }
+        }
+        deserializer.deserialize_map(ComptainerVisitor::new())
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Components {
@@ -221,6 +422,9 @@ pub struct Components {
     pub static_mesh_instances: RwLock<Comptainer<render::StaticMeshInstance>>,
     pub cameras: RwLock<Comptainer<render::Camera>>,
     pub action_handlers: RwLock<Comptainer<game::ActionHandler>>,
+    pub physics_bodies: RwLock<Comptainer<physics::PhysicsBody>>,
+    pub collision_shapes: RwLock<Comptainer<physics::ColliderShape>>,
+    pub uis: RwLock<Comptainer<game::UIComponent>>,
 }
 impl Components {
     pub fn new() -> Self {

@@ -1,12 +1,8 @@
 use std::{
-    error::Error,
-    panic,
-    process::ExitCode,
-    sync::{
+    any::Any, error::Error, num::NonZeroU16, panic, process::ExitCode, sync::{
         mpsc::{channel, Receiver, Sender},
         Arc, RwLock,
-    },
-    thread::{self, JoinHandle},
+    }, thread::{self, JoinHandle}
 };
 
 use clap::Parser;
@@ -23,15 +19,27 @@ use winit::{
     window::Window,
 };
 
-//mod comp_data;
 mod framework;
 mod game;
+mod geometry;
 mod input;
+mod physics;
 mod render;
+mod timer;
 
 pub trait SystemMessage {
     fn stop_msg() -> Self;
     fn system_name() -> &'static str;
+}
+
+fn panic_payload_string(payload: &Box<dyn Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        format!("Box<dyn Any: {:#?}>", payload.type_id())
+    }
 }
 
 #[derive(Debug)]
@@ -165,6 +173,7 @@ impl ApplicationHandler for App {
                     window: self.window.as_ref().unwrap().clone(),
                     res_x: 1280,
                     res_y: 720,
+                    max_framerate: Some(NonZeroU16::new(200).unwrap()),
                 },
             ) {
                 Ok(r) => Some(r),
@@ -175,7 +184,14 @@ impl ApplicationHandler for App {
             };
         }
         if self.game.is_none() {
-            self.game = Some(new_system::<Game>(&self.components, &self.input, ()).unwrap());
+            self.game = Some(
+                new_system::<Game>(
+                    &self.components,
+                    &self.input,
+                    self.render.as_ref().unwrap().sender.clone(),
+                )
+                .unwrap(),
+            );
         }
     }
     fn window_event(
@@ -198,12 +214,18 @@ impl ApplicationHandler for App {
                         .as_ref()
                         .unwrap()
                         .sender
-                        .send(GameMessage::Action(action))
+                        .send(GameMessage::Input(action))
                     {
                         error!("Failed to send key event to game: {err}");
                         panic!();
                     }
                 }
+            }
+            WindowEvent::CursorMoved {
+                device_id: _,
+                position,
+            } => {
+                self.input.write().unwrap().handle_cursor_moved(position);
             }
             WindowEvent::MouseInput {
                 device_id: _,
@@ -221,7 +243,7 @@ impl ApplicationHandler for App {
                         .as_ref()
                         .unwrap()
                         .sender
-                        .send(GameMessage::Action(action))
+                        .send(GameMessage::Input(action))
                     {
                         error!("Failed to send mouse button event to game: {err}");
                         panic!();
@@ -249,7 +271,7 @@ impl ApplicationHandler for App {
                     .as_ref()
                     .unwrap()
                     .sender
-                    .send(GameMessage::Action(action))
+                    .send(GameMessage::Input(action))
                 {
                     error!("Failed to send mouse motion to game: {err}");
                     panic!();
@@ -272,7 +294,7 @@ impl ApplicationHandler for App {
                         panic!();
                     }
                     Err(payload) => {
-                        error!("Render thread panicked");
+                        error!("Render thread panicked: {}", panic_payload_string(&payload));
                         panic::resume_unwind(payload);
                     }
                 }
@@ -282,7 +304,10 @@ impl ApplicationHandler for App {
             if !game.is_thread_active() {
                 let mut game = self.game.take().unwrap();
                 if let Err(payload) = game.thread.take().unwrap().join() {
-                    error!("Game thread panicked");
+                    error!(
+                        "Game thread panicked: {:#?}",
+                        panic_payload_string(&payload)
+                    );
                     panic::resume_unwind(payload);
                 } else {
                     error!("Game stopped without error");
@@ -302,7 +327,9 @@ impl ApplicationHandler for App {
 #[command(version, about)]
 struct CliArgs {
     /// Minimum log level
-    #[arg(short, long, default_value_t = log::LevelFilter::Off)]
+    #[arg(short, long)]
+    #[cfg_attr(debug_assertions, arg(default_value_t = log::LevelFilter::Debug))]
+    #[cfg_attr(not(debug_assertions), arg(default_value_t = log::LevelFilter::Warn))]
     log_level: log::LevelFilter,
 
     /// Output logs to logfile
@@ -312,10 +339,13 @@ struct CliArgs {
 
 fn main() -> ExitCode {
     let args = CliArgs::parse();
-    if let Err(err) = hydrolox_log::init(args.log_level, args.write_logfile) {
-        eprintln!("Failed to initialize log: {err}");
-        return ExitCode::FAILURE;
-    }
+    let _log_state = match hydrolox_log::init(args.log_level, args.write_logfile) {
+        Ok(ls) => ls,
+        Err(err) => {
+            eprintln!("Failed to initialize log: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     info!("Starting Hydrolox");
     info!("Hello World!");
